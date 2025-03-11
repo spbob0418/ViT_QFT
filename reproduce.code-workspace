@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../Megatron-DeepSpeed"
+		},
+		{
+			"path": "../slurm"
+		}
+	],
+	"settings": {}
+}
