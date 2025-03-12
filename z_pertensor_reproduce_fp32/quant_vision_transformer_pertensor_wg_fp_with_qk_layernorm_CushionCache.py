@@ -10,9 +10,10 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import VisionTransformer, _cfg
 from timm.models.registry import register_model
 
+
 import numpy as np
 from probe import probe
-from token_probe import norm_probing_not_sorted
+from token_probe import norm_probing_not_sorted, eval_probe
 from token_select import token_select
 import pandas as pd
 import os
@@ -418,8 +419,9 @@ class Q_Block(nn.Module):
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
         )
+
         
-    def forward(self, x, epoch, iteration, device_id, prefix_token_num):
+    def forward(self, x, is_index_eval, epoch, iteration, device_id, prefix_token_num):
         residual_1 = x
         x = self.norm1(x)
         x = self.attn(x, epoch, iteration, device_id, prefix_token_num)
@@ -439,6 +441,7 @@ class Q_Block(nn.Module):
         if device_id == 0:
             if iteration % 1251 == 0: 
                 norm_probing_not_sorted(x, block_num=self.block_num, layer='Hidden_State', epoch=epoch, iteration=iteration)
+  
         
         return x
 
@@ -447,9 +450,9 @@ class CustomSequential(nn.Module):
         super(CustomSequential, self).__init__()
         self.modules_list = nn.ModuleList(modules)
 
-    def forward(self, x, epoch, iteration, device_id, prefix_token_num):
+    def forward(self, x, is_index_eval, epoch, iteration, device_id, prefix_token_num):
         for module in self.modules_list:
-            x = module(x, epoch, iteration, device_id, prefix_token_num)
+            x = module(x, is_index_eval, epoch, iteration, device_id, prefix_token_num)
         return x
     
 
@@ -497,7 +500,7 @@ class lowbit_VisionTransformer(VisionTransformer):
         #self.reg_token = nn.Parameter(torch.zeros(1, self.prefix_token_num, embed_dim))
         #self.reg_token = nn.Parameter(torch.rand(1, self.prefix_token_num, embed_dim))
         
-    def forward_features(self, x, epoch, iteration, device_id):
+    def forward_features(self, x, is_index_eval, epoch, iteration, device_id):
         #input x : [256, 3, 224, 224]
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -522,13 +525,19 @@ class lowbit_VisionTransformer(VisionTransformer):
         x = x + self.pos_embed
         x = self.pos_drop(x) #256, 197, 384
 
-        x = self.blocks(x, epoch, iteration, device_id, self.prefix_token_num)
-        x = self.norm(x)
+        x = self.blocks(x, is_index_eval, epoch, iteration, device_id, self.prefix_token_num)
+
+        if is_index_eval:
+            return x
         
+        x = self.norm(x)
         return x[:, 0]
 
-    def forward(self, x, epoch=None, iteration=None, device_id=None):
-        x = self.forward_features(x, epoch, iteration, device_id)
+    def forward(self, x, is_index_eval=False, epoch=None, iteration=None, device_id=None):
+        x = self.forward_features(x, is_index_eval, epoch, iteration, device_id)
+
+        if is_index_eval:
+            return x
         # x = self.head(x)
         x = self.head(x, 100, epoch, iteration, device_id, layer_info='Head')
 

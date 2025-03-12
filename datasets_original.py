@@ -8,6 +8,8 @@ from torchvision.datasets.folder import ImageFolder, default_loader
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
+from torch.utils.data import Dataset
+from PIL import Image
 
 
 class INatDataset(ImageFolder):
@@ -107,3 +109,19 @@ def build_transform(is_train, args):
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
     return transforms.Compose(t)
+
+class ImageDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        self.image_paths = [os.path.join(root, f) for f in os.listdir(root) if f.lower().endswith(('.jpg', '.jpeg'))]
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image

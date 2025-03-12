@@ -10,12 +10,14 @@ cd $DIR/$VERSION
 
 WANDB=False
 
+export WANDB
+
 CUDA_VISIBLE_DEVICES=4,5,6,7 taskset -c 32-63 torchrun --nproc_per_node=4 \
 --master_port=$(python3 -c "import random; print(random.randint(29500, 29999))") \
 /home/shkim/QT/deit/finetune.py \
 --model deit_base_patch16_224 \
 --sample-data-path /home/shkim/ViT_zip/sampled_imagenet/one_sample_per_class \
---register-num 0 \
+--register-num 4 \
 --finetune True \
 --transfer-learning True \
 --input-size 224 \

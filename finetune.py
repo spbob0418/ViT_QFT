@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from timm.utils import accuracy, ModelEma
 import math
 
+from datasets_original import build_transform
 
 from transformers import ViTForImageClassification
 from timm.data import Mixup
@@ -27,7 +28,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 # from engine_finetune import train_one_step, evaluate
-from datasets_original import build_dataset
+from datasets_original import build_dataset, ImageDataset
 from losses_original import DistillationLoss
 from samplers import RASampler
 from augment import new_data_aug_generator
@@ -241,6 +242,9 @@ def main(args):
 
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
+    #Sample DataLoader
+    transform = build_transform(is_train=False, args=args)
+    dataset_sample = ImageDataset(args.sample_data_path, transform=transform)
     
     # wandb logging
 
@@ -258,6 +262,8 @@ def main(args):
             wandb_log = False
     else : 
         wandb_log = WANDB_LOG 
+
+        print("WANDB: ", wandb_log)
         if wandb_log :
             wandb.init(project=wandb_project, name=wandb_run_name, config=args)
 
@@ -279,8 +285,11 @@ def main(args):
                       'equal num of samples per-process.')
             sampler_val = torch.utils.data.DistributedSampler(
                 dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+            sampler_sample = torch.utils.data.DistributedSampler(
+                dataset_sample, num_replicas=num_tasks, rank=global_rank, shuffle=False)
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+            sampler_sample = torch.utils.data.SequentialSampler(dataset_sample)
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
@@ -292,11 +301,12 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-
-            
-
+    sample_dataloader = torch.utils.data.DataLoader(
+        dataset_sample, sampler = sampler_sample, 
+        batch_size=250, shuffle=False, 
+        num_workers=args.num_workers,  # Make sure this is > 0
+        pin_memory=args.pin_mem,)
     
-
     if args.ThreeAugment:
         data_loader_train.dataset.transform = new_data_aug_generator(args)
 
@@ -515,6 +525,8 @@ def main(args):
         saver = CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
             checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=False)
+        
+    
 
         
     start_time = time.time()
@@ -522,6 +534,8 @@ def main(args):
     training_step = 0
     dist.barrier()
     data_iterator = iter(data_loader_train)
+    min_std = float('inf')
+    min_max = float('inf')
     
     # ########################################################################
     # # 동결(Freeze)할 파라미터 설정
@@ -560,7 +574,7 @@ def main(args):
         if args.bce_loss:
             targets = targets.gt(0.0).type(targets.dtype)
         
-        outputs = model(samples, epoch=None, iteration=training_step, device_id=device_id)
+        outputs = model(samples, is_index_eval =False, epoch=None, iteration=training_step, device_id=device_id)
     
         loss = criterion(samples, outputs, targets)
         dist.barrier()
@@ -600,10 +614,7 @@ def main(args):
             print(f"Steps [{training_step}/{args.training_steps}] ", metric_logger)
             
 
-        if training_step % (args.accum_steps*50) == 0 and device_id == 0:
-            eval_probe(model, training_step, args)
-
-        if training_step % args.eval_every == 0:
+        if (training_step) % args.eval_every == 0:
         # if training_step in save_cp_point:
             criterion_val = torch.nn.CrossEntropyLoss()
             metric_logger_val = utils.MetricLogger(delimiter="  ")
@@ -650,13 +661,67 @@ def main(args):
                 #                     'scaler': loss_scaler.state_dict(),
                 #                     'args': args,
                 #                 }, checkpoint_path)
+        torch.cuda.empty_cache()
+        dist.barrier()
+        if training_step % (args.accum_steps * 50) == 0:
+            if device_id == 1:
+                print("sample evaluation!")
+            model.eval()
+            accum_x = None  # hidden_state를 저장할 변수 초기화
+            with torch.no_grad():
+                for sample_data in sample_dataloader:
+                    print(len(sample_dataloader))
+                    print(len(sample_data))
+                    sample_data = sample_data.to(device, non_blocking=True)
+                    hidden_state = model(sample_data, is_index_eval=True, epoch=None, iteration=training_step, device_id=device_id)
+                    hidden_state = hidden_state.detach()
+                    print(hidden_state.size())
+                    if accum_x is None:
+                        accum_x = hidden_state
+                    else:
+                        accum_x = torch.cat((accum_x, hidden_state), dim=0)
+                        print(accum_x.size())
+                if device_id == 0 : 
+                    print("eval_probe start")
+                    std, max = eval_probe(accum_x, args.register_num, block_num=11, iteration=training_step)
 
-       
-        
-        if (training_step+0) % args.save_cp_every == 0 and saver is not None and device_id == 0:
-        # if training_step in save_cp_point and saver is not None and device_id == 0:
-            save_metric = metric_logger_val.meters['acc1'].global_avg
-            best_metric, best_epoch = saver.save_checkpoint(epoch=training_step+1, metric=save_metric)
+        torch.cuda.empty_cache()
+        dist.barrier()
+            # # std가 기존 min_std보다 작으면 체크포인트 저장
+            # if std < min_std:
+            #     min_std = std  # 최소 std 갱신
+            #     if args.output_dir:
+            #         checkpoint_paths = [output_dir / 'best_std_checkpoint.pth']
+            #         for checkpoint_path in checkpoint_paths:
+            #             utils.save_on_master({
+            #                 'model': model_without_ddp.state_dict(),
+            #                 'optimizer': optimizer.state_dict(),
+            #                 'lr_scheduler': lr_scheduler.state_dict(),
+            #                 'training_step': training_step,
+            #                 'scaler': loss_scaler.state_dict(),
+            #                 'args': args,
+            #             }, checkpoint_path)
+
+            # # max가 기존 min_max보다 작으면 체크포인트 저장
+            # if max < min_max:
+            #     min_max = max  # 최소 max 갱신
+            #     if args.output_dir:
+            #         checkpoint_paths = [output_dir / 'best_max_checkpoint.pth']
+            #         for checkpoint_path in checkpoint_paths:
+            #             utils.save_on_master({
+            #                 'model': model_without_ddp.state_dict(),
+            #                 'optimizer': optimizer.state_dict(),
+            #                 'lr_scheduler': lr_scheduler.state_dict(),
+            #                 'training_step': training_step,
+            #                 'scaler': loss_scaler.state_dict(),
+            #                 'args': args,
+            #             }, checkpoint_path)
+
+                
+        # if (training_step+0) % args.save_cp_every == 0 and saver is not None and device_id == 0:
+        # # if training_step in save_cp_point and saver is not None and device_id == 0:
+        #     save_metric = metric_logger_val.meters['acc1'].global_avg
+        #     best_metric, best_epoch = saver.save_checkpoint(epoch=training_step+1, metric=save_metric)
         
         torch.cuda.empty_cache()
         dist.barrier()
